@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"github.com/jessevdk/go-flags"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"path"
 	"regexp"
 	"strings"
@@ -27,19 +30,27 @@ var options Options
 var parser = flags.NewParser(&options, flags.Default)
 
 func main() {
-	if _, err := parser.Parse(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	if err := run(ctx); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func run(ctx context.Context) error {
+	if _, err := parser.Parse(); err != nil {
+		return err
 	}
 	if options.StateDir == "" {
 		tmpdir, err := os.MkdirTemp("", "ts-serve-state")
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		options.StateDir = tmpdir
 		defer os.RemoveAll(tmpdir)
 	} else {
 		if err := os.Mkdir(options.StateDir, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-			log.Fatal(err)
+			return err
 		}
 	}
 
@@ -49,7 +60,7 @@ func main() {
 			if errors.Is(err, os.ErrNotExist) {
 				options.Hostname = generateXkcdPw()
 			} else {
-				log.Fatal(err)
+				return err
 			}
 		} else {
 			options.Hostname = string(hostnameData[:])
@@ -58,7 +69,7 @@ func main() {
 	}
 
 	if matched, err := regexp.MatchString(`^[a-z0-9-]{4,40}$`, options.Hostname); err != nil || !matched {
-		log.Fatalf("Bad hostname: %s", options.Hostname)
+		return fmt.Errorf("Bad hostname: %s", options.Hostname)
 	}
 
 	srv := tsnet.Server{
@@ -69,7 +80,7 @@ func main() {
 	}
 
 	if err := srv.Start(); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	defer srv.Close()
@@ -77,40 +88,62 @@ func main() {
 	ln, err := srv.ListenTLS("tcp", ":443")
 
 	if err = srv.Start(); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	for _, domain := range srv.CertDomains() {
 		log.Printf("Listening as https://%s/", domain)
 	}
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
+	conns := make(chan net.Conn, 1)
+	connErrs := make(chan error, 1)
 
-		go func(c net.Conn) {
-			defer c.Close()
-			inner_conn, err := net.Dial("tcp", options.Address)
+	go func() {
+		defer close(conns)
+		defer close(connErrs)
+		for {
+			conn, err := ln.Accept()
 			if err != nil {
-				log.Printf("Failed to connect to address %s: %s", options.Address, err)
+				connErrs <- err
 				return
 			}
-			defer inner_conn.Close()
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go func() {
-				defer wg.Done()
-				io.Copy(c, inner_conn)
-			}()
-			go func() {
-				defer wg.Done()
-				io.Copy(inner_conn, c)
-			}()
-			wg.Wait()
-		}(conn)
+			conns <- conn
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err = <-connErrs:
+			return err
+		case conn := <-conns:
+			go handleConnection(conn)
+		}
 	}
+}
+
+func handleConnection(conn net.Conn) {
+	var wg sync.WaitGroup
+	defer conn.Close()
+	inner_conn, err := net.Dial("tcp", options.Address)
+	if err != nil {
+		log.Printf("Failed to connect to address: %s", options.Address)
+		return
+	}
+	defer inner_conn.Close()
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+		io.Copy(conn, inner_conn)
+	}()
+	go func() {
+		wg.Add(1)
+		defer wg.Done()
+		io.Copy(inner_conn, conn)
+	}()
+
+	wg.Wait()
 }
 
 func generateXkcdPw() string {
