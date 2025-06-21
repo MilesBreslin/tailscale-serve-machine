@@ -9,12 +9,13 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"regexp"
 	"strings"
-	"sync"
 	"tailscale.com/tsnet"
 )
 
@@ -95,55 +96,97 @@ func run(ctx context.Context) error {
 		log.Printf("Listening as https://%s/", domain)
 	}
 
-	conns := make(chan net.Conn, 1)
-	connErrs := make(chan error, 1)
+	httpSrv := http.Server{
+		Handler: &ProxyHandler{},
+	}
 
+	httpCloseErr := make(chan error, 1)
 	go func() {
-		defer close(conns)
-		defer close(connErrs)
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				connErrs <- err
-				return
-			}
-			conns <- conn
-		}
+		defer close(httpCloseErr)
+		<-ctx.Done()
+		httpCloseErr <- httpSrv.Shutdown(context.Background())
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case err = <-connErrs:
-			return err
-		case conn := <-conns:
-			go handleConnection(conn)
+	if err := httpSrv.Serve(ln); err != http.ErrServerClosed {
+		return err
+	}
+	err = <-httpCloseErr
+	return err
+}
+
+var bannedHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailers",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func copyHeaders(src, dst http.Header) {
+headerLoop:
+	for k, vv := range src {
+		k = http.CanonicalHeaderKey(k)
+		for _, bannedHeader := range bannedHeaders {
+			if k == bannedHeader {
+				continue headerLoop
+			}
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
 		}
 	}
 }
 
-func handleConnection(conn net.Conn) {
-	var wg sync.WaitGroup
-	defer conn.Close()
-	inner_conn, err := net.Dial("tcp", options.Address)
+type ProxyHandler struct{}
+
+func (_ *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.URL.Path)
+	client := &http.Client{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cliReq, err := http.NewRequestWithContext(
+		ctx,
+		r.Method,
+		(&url.URL{
+			Scheme:   "http",
+			Host:     options.Address,
+			User:     r.URL.User,
+			Path:     r.URL.Path,
+			RawPath:  r.URL.RawPath,
+			RawQuery: r.URL.RawQuery,
+		}).String(),
+		r.Body,
+	)
 	if err != nil {
-		log.Printf("Failed to connect to address: %s", options.Address)
+		http.Error(w, "Bad request", http.StatusBadGateway)
+	}
+	cliReq.Host = options.Hostname
+
+	copyHeaders(r.Header, cliReq.Header)
+
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err != nil {
+		http.Error(w, "Bad Source IP", http.StatusBadGateway)
+		return
+	} else {
+		cliReq.Header.Set("X-Forwarded-For", ip)
+	}
+
+	resp, err := client.Do(cliReq)
+	if err != nil {
+		log.Printf("Failed to connect to gateway: %v", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
-	defer inner_conn.Close()
-	go func() {
-		wg.Add(1)
-		defer wg.Done()
-		io.Copy(conn, inner_conn)
-	}()
-	go func() {
-		wg.Add(1)
-		defer wg.Done()
-		io.Copy(inner_conn, conn)
-	}()
+	defer resp.Body.Close()
 
-	wg.Wait()
+	copyHeaders(resp.Header, w.Header())
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func generateXkcdPw() string {
