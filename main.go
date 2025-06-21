@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/CAFxX/httpcompression"
 	"github.com/jessevdk/go-flags"
 	"io"
 	"log"
@@ -96,10 +97,17 @@ func run(ctx context.Context) error {
 		log.Printf("Listening as https://%s/", domain)
 	}
 
+	compress, err := httpcompression.DefaultAdapter()
+	if err != nil {
+		return err
+	}
+
 	httpSrv := http.Server{
-		Handler: &ProxyHandler{
-			fqdn: srv.CertDomains()[0],
-		},
+		Handler: compress(
+			&ProxyHandler{
+				fqdn: srv.CertDomains()[0],
+			},
+		),
 	}
 
 	httpCloseErr := make(chan error, 1)
