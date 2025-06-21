@@ -97,7 +97,9 @@ func run(ctx context.Context) error {
 	}
 
 	httpSrv := http.Server{
-		Handler: &ProxyHandler{},
+		Handler: &ProxyHandler{
+			fqdn: srv.CertDomains()[0],
+		},
 	}
 
 	httpCloseErr := make(chan error, 1)
@@ -140,9 +142,11 @@ headerLoop:
 	}
 }
 
-type ProxyHandler struct{}
+type ProxyHandler struct {
+	fqdn string
+}
 
-func (_ *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.URL.Path)
 	client := &http.Client{}
 
@@ -165,7 +169,7 @@ func (_ *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadGateway)
 	}
-	cliReq.Host = options.Hostname
+	cliReq.Host = p.fqdn
 
 	copyHeaders(r.Header, cliReq.Header)
 
