@@ -6,11 +6,10 @@ import (
 	"fmt"
 	"github.com/CAFxX/httpcompression"
 	"github.com/jessevdk/go-flags"
-	"io"
 	"log"
 	"math/rand"
-	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -102,12 +101,16 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	proxy := httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			log.Printf("%s: %s %s", r.In.RemoteAddr, r.In.Method, r.In.URL.Path)
+			r.SetXForwarded()
+			r.SetURL(&url.URL{Scheme: "http", Host: options.Address})
+		},
+	}
+
 	httpSrv := http.Server{
-		Handler: compress(
-			&ProxyHandler{
-				fqdn: srv.CertDomains()[0],
-			},
-		),
+		Handler: compress(&proxy),
 	}
 
 	httpCloseErr := make(chan error, 1)
@@ -122,83 +125,6 @@ func run(ctx context.Context) error {
 	}
 	err = <-httpCloseErr
 	return err
-}
-
-var bannedHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailers",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
-func copyHeaders(src, dst http.Header) {
-headerLoop:
-	for k, vv := range src {
-		k = http.CanonicalHeaderKey(k)
-		for _, bannedHeader := range bannedHeaders {
-			if k == bannedHeader {
-				continue headerLoop
-			}
-		}
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
-	}
-}
-
-type ProxyHandler struct {
-	fqdn string
-}
-
-func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.URL.Path)
-	client := &http.Client{}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	cliReq, err := http.NewRequestWithContext(
-		ctx,
-		r.Method,
-		(&url.URL{
-			Scheme:   "http",
-			Host:     options.Address,
-			User:     r.URL.User,
-			Path:     r.URL.Path,
-			RawPath:  r.URL.RawPath,
-			RawQuery: r.URL.RawQuery,
-		}).String(),
-		r.Body,
-	)
-	if err != nil {
-		http.Error(w, "Bad request", http.StatusBadGateway)
-	}
-	cliReq.Host = p.fqdn
-
-	copyHeaders(r.Header, cliReq.Header)
-
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err != nil {
-		http.Error(w, "Bad Source IP", http.StatusBadGateway)
-		return
-	} else {
-		cliReq.Header.Set("X-Forwarded-For", ip)
-	}
-
-	resp, err := client.Do(cliReq)
-	if err != nil {
-		log.Printf("Failed to connect to gateway: %v", err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	copyHeaders(resp.Header, w.Header())
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
 }
 
 func generateXkcdPw() string {
