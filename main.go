@@ -86,6 +86,11 @@ func run(ctx context.Context) error {
 
 	defer srv.Close()
 
+	localClient, err := srv.LocalClient()
+	if err != nil {
+		return err
+	}
+
 	ln, err := srv.ListenTLS("tcp", ":443")
 
 	if err = srv.Start(); err != nil {
@@ -103,7 +108,15 @@ func run(ctx context.Context) error {
 
 	proxy := httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
-			log.Printf("%s: %s %s", r.In.RemoteAddr, r.In.Method, r.In.URL.Path)
+			// Log the request. Do not block on WhoIs.
+			go func() {
+				addr := r.In.RemoteAddr
+				whois, err := localClient.WhoIs(context.Background(), r.In.RemoteAddr)
+				if err == nil {
+					addr = whois.Node.ComputedName
+				}
+				log.Printf("%s: %s %s", addr, r.In.Method, r.In.URL.Path)
+			}()
 			r.SetXForwarded()
 			r.SetURL(&url.URL{Scheme: "http", Host: options.Address})
 		},
