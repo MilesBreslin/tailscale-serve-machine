@@ -1,6 +1,6 @@
 { buildGoModule
 , src ? ./.
-, vendorHash ? "sha256-9hw5oJOTC21JpUSMQP9EzYt2hdE0JUWrEDfhCbElQx0="
+, vendorHash ? "sha256-ti122PvZi5vzFIfTIFXSqKP270Oz5qXCr/IvdwHR91g="
 }:
 
 buildGoModule {
